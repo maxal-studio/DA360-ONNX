@@ -1,0 +1,3 @@
+# Exported *.onnx files live here; keep the folder in the repo without committing weights
+*
+!.gitignore
