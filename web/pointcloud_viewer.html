@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DA360 ASCII PLY viewer (Three.js)</title>
+  <style>
+    body { margin: 0; overflow: hidden; font-family: system-ui, sans-serif; }
+    #bar {
+      position: absolute; top: 0; left: 0; right: 0; z-index: 1;
+      padding: 10px 14px; background: rgba(20,20,24,.85); color: #eee;
+      display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    }
+    #bar label { cursor: pointer; }
+    #bar input[type="file"] { max-width: 240px; }
+    #bar button.zoom {
+      cursor: pointer;
+      padding: 6px 12px;
+      border-radius: 6px;
+      border: 1px solid #444;
+      background: #2a2a32;
+      color: #eee;
+      font-size: 14px;
+    }
+    #bar button.zoom:hover { background: #383844; }
+    #hint { font-size: 13px; opacity: .85; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <div id="bar">
+    <label>Open ASCII PLY: <input type="file" id="file" accept=".ply" /></label>
+    <label title="DA360 saver.py maps image top (sky) to negative Y; Three.js +Y is up — flip matches intuitive orientation">
+      <input type="checkbox" id="flipY" checked /> Flip Y for Three.js
+    </label>
+    <label title="If the panorama appears mirrored left–right in 3D">
+      <input type="checkbox" id="flipX" /> Flip X
+    </label>
+    <span class="zoom-group" title="Also: mouse wheel, + / − keys">
+      <button type="button" class="zoom" id="zoomOut" aria-label="Zoom out">−</button>
+      <button type="button" class="zoom" id="zoomIn" aria-label="Zoom in">+</button>
+    </span>
+    <span id="hint">Orbit: drag · Zoom: wheel / buttons / + − · Uncheck flip if your tool already matches DA360/Open3D.</span>
+  </div>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    import { PLYLoader } from "three/addons/loaders/PLYLoader.js";
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x1a1a1f);
+
+    const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.01, 5000);
+    camera.position.set(0, 0, 4);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.enableZoom = true;
+    controls.zoomSpeed = 1.2;
+
+    // Move camera toward or away from orbit target (factor < 1 => zoom in).
+    function dolly(factor) {
+      const offset = new THREE.Vector3().subVectors(camera.position, controls.target);
+      const dist = offset.length();
+      if (dist < 1e-12) return;
+      offset.normalize();
+      const minD = Math.max(camera.near * 2, 1e-6);
+      const maxD = Math.min(camera.far * 0.99, 1e15);
+      const newDist = THREE.MathUtils.clamp(dist * factor, minD, maxD);
+      offset.multiplyScalar(newDist);
+      camera.position.copy(controls.target.clone().add(offset));
+      controls.update();
+    }
+
+    document.getElementById("zoomIn").addEventListener("click", () => dolly(0.85));
+    document.getElementById("zoomOut").addEventListener("click", () => dolly(1 / 0.85));
+
+    window.addEventListener("keydown", (e) => {
+      if (e.target.matches("input, textarea")) return;
+      if (e.key === "+" || e.key === "=") {
+        e.preventDefault();
+        dolly(0.85);
+      } else if (e.key === "-" || e.key === "_") {
+        e.preventDefault();
+        dolly(1 / 0.85);
+      }
+    });
+
+    scene.add(new THREE.AmbientLight(0xffffff, 1.2));
+
+    let points = null;
+
+    function fitCameraToObject(obj) {
+      const box = new THREE.Box3().setFromObject(obj);
+      const size = box.getSize(new THREE.Vector3());
+      const center = box.getCenter(new THREE.Vector3());
+      const maxDim = Math.max(size.x, size.y, size.z, 1e-6);
+      const dist = maxDim * 1.8;
+      controls.target.copy(center);
+      camera.position.copy(center.clone().add(new THREE.Vector3(dist * 0.6, dist * 0.35, dist * 0.9)));
+      camera.near = maxDim / 2000;
+      camera.far = maxDim * 200;
+      camera.updateProjectionMatrix();
+      controls.update();
+    }
+
+    function loadPlyText(text) {
+      if (points) {
+        scene.remove(points);
+        points.geometry.dispose();
+        if (points.material.map) points.material.map.dispose();
+        points.material.dispose();
+        points = null;
+      }
+      const loader = new PLYLoader();
+      const geom = loader.parse(text);
+      geom.computeBoundingSphere();
+      const mat = new THREE.PointsMaterial({
+        size: Math.max(0.002, (geom.boundingSphere?.radius || 1) * 0.0025),
+        sizeAttenuation: true,
+        vertexColors: true,
+      });
+      points = new THREE.Points(geom, mat);
+      const sx = document.getElementById("flipX").checked ? -1 : 1;
+      const sy = document.getElementById("flipY").checked ? -1 : 1;
+      points.scale.set(sx, sy, 1);
+      scene.add(points);
+      fitCameraToObject(points);
+    }
+
+    document.getElementById("flipY").addEventListener("change", () => {
+      if (points) {
+        points.scale.y = document.getElementById("flipY").checked ? -1 : 1;
+        points.updateMatrixWorld(true);
+        fitCameraToObject(points);
+      }
+    });
+    document.getElementById("flipX").addEventListener("change", () => {
+      if (points) {
+        points.scale.x = document.getElementById("flipX").checked ? -1 : 1;
+        points.updateMatrixWorld(true);
+        fitCameraToObject(points);
+      }
+    });
+
+    document.getElementById("file").addEventListener("change", (e) => {
+      const f = e.target.files?.[0];
+      if (!f) return;
+      const reader = new FileReader();
+      reader.onload = () => loadPlyText(reader.result);
+      reader.readAsArrayBuffer(f);
+    });
+
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    function tick() {
+      requestAnimationFrame(tick);
+      controls.update();
+      renderer.render(scene, camera);
+    }
+    tick();
+  </script>
+</body>
+</html>

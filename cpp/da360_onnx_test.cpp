@@ -1,16 +1,13 @@
 /*
  * DA360 ONNX smoke test (OpenCV + ONNX Runtime).
  *
- * Build (example, Apple Silicon + Homebrew): see README.md “C++ smoke test”.
- *   brew install onnxruntime opencv cmake && cd cpp && cmake -S . -B build && cmake --build build
- *
- * CMake: ORT_ROOT defaults to /opt/homebrew; override with -DORT_ROOT=$(brew --prefix onnxruntime).
+ * Optional --ply-flip-y / --ply-flip-x adjust world axes for viewers (see README).
  *
  * Run:
- *   ./build/da360_onnx_test ../DA360_small.onnx ../input/panorama.jpg ../pred_disp_vis.png
+ *   ./build/da360_onnx_test ../onnx_models/small.onnx ../input/panorama.jpg \
+ *       --preview ../output/preview.png --ply ../output/cloud.ply
  *
- * Input ONNX tensor: normalized_rgb  NCHW float32, ImageNet norm (same as DA360 datasets/real.py).
- * Default spatial size is read from the model (typically 518 x 1036).
+ * See README.md for Python deps and Three.js viewer (`web/pointcloud_viewer.html`).
  */
 
 #include <onnxruntime_cxx_api.h>
@@ -20,8 +17,9 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -30,20 +28,24 @@ namespace {
 
 constexpr float kMean[3] = {0.485f, 0.456f, 0.406f};
 constexpr float kStd[3] = {0.229f, 0.224f, 0.225f};
+constexpr float kDepthFarClip = 200.f;  // matches DA360 saver.save_as_point_cloud mask
 
 int64_t DimOr(int64_t d, int64_t fallback) {
-  if (d <= 0) {  // includes ONNX dynamic dim -1
+  if (d <= 0) {
     return fallback;
   }
   return d;
 }
 
-void PreprocessRgb(const cv::Mat& rgb_u8, int H, int W, std::vector<float>& out_nchw) {
+void PreprocessRgb(const cv::Mat& rgb_u8, int H, int W, std::vector<float>& out_nchw, cv::Mat* resized_rgb_u8_out) {
   if (rgb_u8.type() != CV_8UC3) {
     throw std::runtime_error("Expected CV_8UC3 RGB image");
   }
   cv::Mat resized;
   cv::resize(rgb_u8, resized, cv::Size(W, H), 0, 0, cv::INTER_CUBIC);
+  if (resized_rgb_u8_out != nullptr) {
+    *resized_rgb_u8_out = resized.clone();
+  }
   cv::Mat f;
   resized.convertTo(f, CV_32FC3, 1.0 / 255.0);
 
@@ -76,16 +78,141 @@ void SaveDisparityPreview(const float* data, int H, int W, const std::string& pa
   }
 }
 
+void DispToRelativeDepth(const float* disp, int H, int W, std::vector<float>* depth_out) {
+  depth_out->assign(static_cast<size_t>(H * W), 0.f);
+  float min_pos = std::numeric_limits<float>::infinity();
+  for (int y = 0; y < H; ++y) {
+    for (int x = 0; x < W; ++x) {
+      float d = disp[y * W + x];
+      float dep = (d > 1e-6f) ? (1.0f / d) : 0.f;
+      (*depth_out)[static_cast<size_t>(y * W + x)] = dep;
+      if (dep > 0.f && std::isfinite(dep)) {
+        min_pos = std::min(min_pos, dep);
+      }
+    }
+  }
+  if (!std::isfinite(min_pos) || min_pos <= 0.f) {
+    min_pos = 1.f;
+  }
+  for (float& v : *depth_out) {
+    if (v > 0.f) {
+      v /= min_pos;
+    }
+  }
+}
+
+void WriteAsciiPlyEquirect(const std::vector<float>& depth,
+                           const cv::Mat& rgb_hw_uint8,
+                           int H,
+                           int W,
+                           const std::string& path,
+                           bool flip_y,
+                           bool flip_x) {
+  if (rgb_hw_uint8.rows != H || rgb_hw_uint8.cols != W || rgb_hw_uint8.type() != CV_8UC3) {
+    throw std::runtime_error("RGB size/type mismatch for point cloud");
+  }
+
+  const double pi = static_cast<double>(M_PI);
+  std::vector<double> xs, ys, zs;
+  std::vector<uint8_t> cr, cg, cb;
+  xs.reserve(static_cast<size_t>(H * W) / 4);
+  ys.reserve(xs.capacity());
+  zs.reserve(xs.capacity());
+  cr.reserve(xs.capacity());
+  cg.reserve(xs.capacity());
+  cb.reserve(xs.capacity());
+
+  // Same Theta/Phi as DA360 saver.py (integer pixel indices).
+  for (int y = 0; y < H; ++y) {
+    double theta = pi - static_cast<double>(y) * pi / static_cast<double>(H) - pi / (2.0 * static_cast<double>(H));
+    double sin_t = std::sin(theta);
+    double cos_t = std::cos(theta);
+    for (int x = 0; x < W; ++x) {
+      float dep = depth[static_cast<size_t>(y * W + x)];
+      if (!(dep > 0.f) || !(dep < kDepthFarClip)) {
+        continue;
+      }
+      double phi =
+          static_cast<double>(x) * 2.0 * pi / static_cast<double>(W) + pi / static_cast<double>(W) - pi;
+      double sin_p = std::sin(phi);
+      double cos_p = std::cos(phi);
+      double xd = static_cast<double>(dep) * sin_t * sin_p;
+      double yd = static_cast<double>(dep) * cos_t;
+      double zd = static_cast<double>(dep) * sin_t * cos_p;
+      if (flip_x) {
+        xd = -xd;
+      }
+      if (flip_y) {
+        yd = -yd;
+      }
+      xs.push_back(xd);
+      ys.push_back(yd);
+      zs.push_back(zd);
+      const cv::Vec3b& px = rgb_hw_uint8.at<cv::Vec3b>(y, x);
+      cr.push_back(px[0]);
+      cg.push_back(px[1]);
+      cb.push_back(px[2]);
+    }
+  }
+
+  std::ofstream out(path);
+  if (!out) {
+    throw std::runtime_error("Cannot write PLY: " + path);
+  }
+  const size_t n = xs.size();
+  out << "ply\nformat ascii 1.0\ncomment DA360-style ERP point cloud\n";
+  out << "element vertex " << n << "\n";
+  out << "property float x\nproperty float y\nproperty float z\n";
+  out << "property uchar red\nproperty uchar green\nproperty uchar blue\n";
+  out << "end_header\n";
+  out.precision(9);
+  for (size_t i = 0; i < n; ++i) {
+    out << xs[i] << " " << ys[i] << " " << zs[i] << " ";
+    out << static_cast<int>(cr[i]) << " " << static_cast<int>(cg[i]) << " " << static_cast<int>(cb[i]) << "\n";
+  }
+}
+
+void PrintUsage(const char* prog) {
+  std::cerr << "Usage: " << prog
+            << " <model.onnx> <input_image> [--preview out.png] [--ply out.ply] [--ply-flip-y] [--ply-flip-x]\n";
+  std::cerr << "  Default preview: pred_disp_preview.png\n";
+  std::cerr << "  Point cloud: same Theta/Phi as DA360 saver.py; depth = (1/disp)/min(depth); mask depth < "
+            << kDepthFarClip << "\n";
+  std::cerr << "  --ply-flip-y  Negate world Y in PLY (DA360 puts image-top at Y<0; many viewers expect +Y up).\n";
+  std::cerr << "  --ply-flip-x  Negate world X (try if left/right looks mirrored in 3D).\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc < 3 || argc > 4) {
-    std::cerr << "Usage: " << argv[0] << " <model.onnx> <input_image> [output_preview.png]\n";
+  if (argc < 3) {
+    PrintUsage(argv[0]);
     return 1;
   }
+
   const std::string model_path = argv[1];
   const std::string image_path = argv[2];
-  const std::string out_path = (argc >= 4) ? argv[3] : "pred_disp_preview.png";
+  std::string out_path = "pred_disp_preview.png";
+  std::string ply_path;
+  bool ply_flip_y = false;
+  bool ply_flip_x = false;
+
+  for (int i = 3; i < argc; ++i) {
+    std::string a = argv[i];
+    if (a == "--ply" && i + 1 < argc) {
+      ply_path = argv[++i];
+    } else if (a == "--preview" && i + 1 < argc) {
+      out_path = argv[++i];
+    } else if (a == "--ply-flip-y") {
+      ply_flip_y = true;
+    } else if (a == "--ply-flip-x") {
+      ply_flip_x = true;
+    } else {
+      std::cerr << "Unknown or incomplete argument: " << a << "\n";
+      PrintUsage(argv[0]);
+      return 1;
+    }
+  }
 
   cv::Mat bgr = cv::imread(image_path, cv::IMREAD_COLOR);
   if (bgr.empty()) {
@@ -107,9 +234,6 @@ int main(int argc, char** argv) {
   Ort::Session session(env, model_path.c_str(), session_opts);
 #endif
 
-  Ort::AllocatorWithDefaultOptions allocator;
-
-  // Input shape from model (batch may be dynamic).
   Ort::TypeInfo in_type = session.GetInputTypeInfo(0);
   auto in_shape_info = in_type.GetTensorTypeAndShapeInfo();
   std::vector<int64_t> in_shape = in_shape_info.GetShape();
@@ -127,8 +251,9 @@ int main(int argc, char** argv) {
   }
   std::cout << "Model input spatial size: " << H << " x " << W << " (resizing " << image_path << ")\n";
 
+  cv::Mat resized_rgb_u8;
   std::vector<float> input_tensor;
-  PreprocessRgb(rgb, static_cast<int>(H), static_cast<int>(W), input_tensor);
+  PreprocessRgb(rgb, static_cast<int>(H), static_cast<int>(W), input_tensor, &resized_rgb_u8);
 
   std::vector<int64_t> input_dims = {N, C, H, W};
   Ort::MemoryInfo mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
@@ -164,12 +289,20 @@ int main(int argc, char** argv) {
   }
 
   const size_t plane = static_cast<size_t>(oh) * static_cast<size_t>(ow);
-  if (outputs[0].GetTensorTypeAndShapeInfo().GetElementCount() < static_cast<size_t>(plane)) {
+  if (outputs[0].GetTensorTypeAndShapeInfo().GetElementCount() < plane) {
     std::cerr << "Output element count too small for inferred HxW\n";
     return 1;
   }
 
   SaveDisparityPreview(out_data, oh, ow, out_path);
   std::cout << "Wrote preview: " << out_path << "\n";
+
+  if (!ply_path.empty()) {
+    std::vector<float> depth;
+    DispToRelativeDepth(out_data, oh, ow, &depth);
+    WriteAsciiPlyEquirect(depth, resized_rgb_u8, oh, ow, ply_path, ply_flip_y, ply_flip_x);
+    std::cout << "Wrote point cloud (ASCII PLY): " << ply_path << "\n";
+  }
+
   return 0;
 }

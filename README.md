@@ -7,7 +7,8 @@ Export [Insta360 DA360](https://github.com/Insta360-Research-Team/DA360) (“Dep
 | Path                           | Purpose                                                                                                                                                         |
 | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `src/convert_da360_to_onnx.py` | PyTorch → ONNX export (needs a local clone of the official DA360 repo).                                                                                         |
-| `cpp/`                         | Sample **OpenCV + ONNX Runtime** tester: load an image, preprocess like DA360’s `Real` dataset, run `normalized_rgb` → `pred_disp`, save a false-color preview. |
+| `cpp/`                         | **OpenCV + ONNX Runtime** inference: `normalized_rgb` → `pred_disp`, disparity preview PNG, optional **ASCII PLY** point cloud (ERP unprojection like DA360 `saver.py`). |
+| `web/pointcloud_viewer.html`   | Minimal **Three.js** viewer: open a `.ply` file in the browser (no server required).                                                                              |
 
 ## ONNX contract
 
@@ -17,6 +18,12 @@ The exporter traces the same tensors as DA360’s `test.py`:
 - **Output** `pred_disp`: disparity; many pipelines use `1 / pred_disp` for relative depth.
 
 `H` and `W` come from the checkpoint by default (typically **518×1036**) and must be divisible by **14**. During export, the xFormers attention path is disabled so tracing uses standard attention (better ONNX compatibility on macOS where xFormers may not install).
+
+### Point clouds: ONNX vs post-processing
+
+Upstream DA360 builds colored point clouds in **`saver.py`** (`save_as_point_cloud`): disparity → depth (`1 / pred_disp`, then divide by min depth like **`test.py`**), then **equirectangular-to-Euclidean** mapping for each pixel with optional masking (`pred_depth < 200`). That is **deterministic geometry**, not part of the neural network.
+
+This repo keeps **only `pred_disp` in ONNX** (same as PyTorch export). **Depth normalization + ERP unprojection + PLY writing** run in C++ after inference when you pass **`--ply`**, matching the same formulas as `saver.py` so you do not need Open3D or Python at runtime for point clouds.
 
 ## Python setup
 
@@ -122,17 +129,42 @@ If `libonnxruntime.dylib` is not under `/opt/homebrew/lib`:
 cmake -S . -B build -DORT_ROOT="$(brew --prefix onnxruntime)"
 ```
 
-Run from **`cpp/`** after building (adjust the `.onnx` name if you used a different checkpoint):
+Run from **`cpp/`** after building (adjust paths as needed):
 
 ```bash
 cd cpp
+mkdir -p ../output
+
 ./build/da360_onnx_test \
   ../onnx_models/DA360_small.onnx \
   ../input/panorama.jpg \
-  ../output/preview.png
+  --preview ../output/preview.png \
+  --ply ../output/cloud.ply
 ```
 
+- **`--preview`** — false-color disparity heatmap (optional; default file name `pred_disp_preview.png` if you omit flags).
+- **`--ply`** — optional **ASCII PLY** point cloud with RGB from the resized panorama (same ERP math as DA360 `saver.save_as_point_cloud`).
+- **`--ply-flip-y`** — negate **Y** in the PLY file (see orientation note below).
+- **`--ply-flip-x`** — negate **X** (try if left/right looks mirrored in 3D).
+
 The program reads input spatial size from the ONNX model and resizes the image with cubic interpolation to match DA360’s preprocessing style.
+
+### Point cloud orientation (why it can look “flipped”)
+
+The C++ math matches **`saver.py`**: `Y = depth * cos(Theta)` with `Theta` decreasing from the **top** image row toward the bottom. That puts the **top of the equirectangle** (often sky / north pole of the sphere) at **negative** world **Y**. Many 3D viewers (including **Three.js** with +Y as “up”) then show the scene **vertically inverted** compared to what feels natural.
+
+- **`web/pointcloud_viewer.html`** enables **“Flip Y for Three.js”** by default (applies `scale.y = -1` on the loaded points). Uncheck it if you already flipped at export or use a tool that matches DA360’s axes.
+- For **CloudCompare, MeshLab, etc.**, either rotate the cloud in-app or re-export with **`--ply-flip-y`** so the file itself has sky at +Y.
+
+If the texture looks **mirrored left–right** on the sphere, try **`--ply-flip-x`** or toggle **Flip X** in the web viewer.
+
+### Viewing `.ply` in the browser (Three.js)
+
+Open **`web/pointcloud_viewer.html`** locally (double-click or “Open with” a browser). Click **Open ASCII PLY** and choose the file produced by **`--ply`**. Uses **Three.js** + **`PLYLoader`** + **`OrbitControls`** from `cdn.jsdelivr.net` (loads online — needs internet once).
+
+**Flip Y for Three.js** is checked by default (see [Point cloud orientation](#point-cloud-orientation-why-it-can-look-flipped)). **Flip X** is optional for left–right mirroring.
+
+No local server is required because the page uses a **file input** (not `fetch`). Large clouds (~400k points) may take a few seconds to parse.
 
 ## Troubleshooting
 
