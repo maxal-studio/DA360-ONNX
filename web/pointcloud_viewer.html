@@ -1,181 +1,459 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>DA360 ASCII PLY viewer (Three.js)</title>
-  <style>
-    body { margin: 0; overflow: hidden; font-family: system-ui, sans-serif; }
-    #bar {
-      position: absolute; top: 0; left: 0; right: 0; z-index: 1;
-      padding: 10px 14px; background: rgba(20,20,24,.85); color: #eee;
-      display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
-    }
-    #bar label { cursor: pointer; }
-    #bar input[type="file"] { max-width: 240px; }
-    #bar button.zoom {
-      cursor: pointer;
-      padding: 6px 12px;
-      border-radius: 6px;
-      border: 1px solid #444;
-      background: #2a2a32;
-      color: #eee;
-      font-size: 14px;
-    }
-    #bar button.zoom:hover { background: #383844; }
-    #hint { font-size: 13px; opacity: .85; }
-    canvas { display: block; }
-  </style>
-</head>
-<body>
-  <div id="bar">
-    <label>Open ASCII PLY: <input type="file" id="file" accept=".ply" /></label>
-    <label title="DA360 saver.py maps image top (sky) to negative Y; Three.js +Y is up — flip matches intuitive orientation">
-      <input type="checkbox" id="flipY" checked /> Flip Y for Three.js
-    </label>
-    <label title="If the panorama appears mirrored left–right in 3D">
-      <input type="checkbox" id="flipX" /> Flip X
-    </label>
-    <span class="zoom-group" title="Also: mouse wheel, + / − keys">
-      <button type="button" class="zoom" id="zoomOut" aria-label="Zoom out">−</button>
-      <button type="button" class="zoom" id="zoomIn" aria-label="Zoom in">+</button>
-    </span>
-    <span id="hint">Orbit: drag · Zoom: wheel / buttons / + − · Uncheck flip if your tool already matches DA360/Open3D.</span>
-  </div>
-  <script type="importmap">
-  {
-    "imports": {
-      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
-    }
-  }
-  </script>
-  <script type="module">
-    import * as THREE from "three";
-    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-    import { PLYLoader } from "three/addons/loaders/PLYLoader.js";
-
-    const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x1a1a1f);
-
-    const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.01, 5000);
-    camera.position.set(0, 0, 4);
-
-    const renderer = new THREE.WebGLRenderer({ antialias: true });
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    document.body.appendChild(renderer.domElement);
-
-    const controls = new OrbitControls(camera, renderer.domElement);
-    controls.enableDamping = true;
-    controls.enableZoom = true;
-    controls.zoomSpeed = 1.2;
-
-    // Move camera toward or away from orbit target (factor < 1 => zoom in).
-    function dolly(factor) {
-      const offset = new THREE.Vector3().subVectors(camera.position, controls.target);
-      const dist = offset.length();
-      if (dist < 1e-12) return;
-      offset.normalize();
-      const minD = Math.max(camera.near * 2, 1e-6);
-      const maxD = Math.min(camera.far * 0.99, 1e15);
-      const newDist = THREE.MathUtils.clamp(dist * factor, minD, maxD);
-      offset.multiplyScalar(newDist);
-      camera.position.copy(controls.target.clone().add(offset));
-      controls.update();
-    }
-
-    document.getElementById("zoomIn").addEventListener("click", () => dolly(0.85));
-    document.getElementById("zoomOut").addEventListener("click", () => dolly(1 / 0.85));
-
-    window.addEventListener("keydown", (e) => {
-      if (e.target.matches("input, textarea")) return;
-      if (e.key === "+" || e.key === "=") {
-        e.preventDefault();
-        dolly(0.85);
-      } else if (e.key === "-" || e.key === "_") {
-        e.preventDefault();
-        dolly(1 / 0.85);
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DA360 ASCII PLY viewer (Three.js)</title>
+    <style>
+      body {
+        margin: 0;
+        overflow: hidden;
+        font-family: system-ui, sans-serif;
       }
-    });
-
-    scene.add(new THREE.AmbientLight(0xffffff, 1.2));
-
-    let points = null;
-
-    function fitCameraToObject(obj) {
-      const box = new THREE.Box3().setFromObject(obj);
-      const size = box.getSize(new THREE.Vector3());
-      const center = box.getCenter(new THREE.Vector3());
-      const maxDim = Math.max(size.x, size.y, size.z, 1e-6);
-      const dist = maxDim * 1.8;
-      controls.target.copy(center);
-      camera.position.copy(center.clone().add(new THREE.Vector3(dist * 0.6, dist * 0.35, dist * 0.9)));
-      camera.near = maxDim / 2000;
-      camera.far = maxDim * 200;
-      camera.updateProjectionMatrix();
-      controls.update();
-    }
-
-    function loadPlyText(text) {
-      if (points) {
-        scene.remove(points);
-        points.geometry.dispose();
-        if (points.material.map) points.material.map.dispose();
-        points.material.dispose();
-        points = null;
+      #bar {
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        z-index: 1;
+        padding: 10px 14px;
+        background: rgba(20, 20, 24, 0.85);
+        color: #eee;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
       }
-      const loader = new PLYLoader();
-      const geom = loader.parse(text);
-      geom.computeBoundingSphere();
-      const mat = new THREE.PointsMaterial({
-        size: Math.max(0.002, (geom.boundingSphere?.radius || 1) * 0.0025),
-        sizeAttenuation: true,
-        vertexColors: true,
-      });
-      points = new THREE.Points(geom, mat);
-      const sx = document.getElementById("flipX").checked ? -1 : 1;
-      const sy = document.getElementById("flipY").checked ? -1 : 1;
-      points.scale.set(sx, sy, 1);
-      scene.add(points);
-      fitCameraToObject(points);
-    }
-
-    document.getElementById("flipY").addEventListener("change", () => {
-      if (points) {
-        points.scale.y = document.getElementById("flipY").checked ? -1 : 1;
-        points.updateMatrixWorld(true);
-        fitCameraToObject(points);
+      #bar label {
+        cursor: pointer;
       }
-    });
-    document.getElementById("flipX").addEventListener("change", () => {
-      if (points) {
-        points.scale.x = document.getElementById("flipX").checked ? -1 : 1;
-        points.updateMatrixWorld(true);
-        fitCameraToObject(points);
+      #bar input[type="file"] {
+        max-width: 240px;
       }
-    });
+      #bar button.zoom {
+        cursor: pointer;
+        padding: 6px 12px;
+        border-radius: 6px;
+        border: 1px solid #444;
+        background: #2a2a32;
+        color: #eee;
+        font-size: 14px;
+      }
+      #bar button.zoom:hover {
+        background: #383844;
+      }
+      #hint {
+        font-size: 13px;
+        opacity: 0.85;
+      }
+      canvas {
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="bar">
+      <label
+        >Open ASCII PLY: <input type="file" id="file" accept=".ply"
+      /></label>
+      <label
+        title="DA360 saver.py maps image top (sky) to negative Y; Three.js +Y is up — flip matches intuitive orientation"
+      >
+        <input type="checkbox" id="flipY" checked /> Flip Y for Three.js
+      </label>
+      <label title="If the panorama appears mirrored left–right in 3D">
+        <input type="checkbox" id="flipX" checked /> Flip X
+      </label>
+      <span class="zoom-group" title="Also: mouse wheel, + / − keys">
+        <button type="button" class="zoom" id="zoomOut" aria-label="Zoom out">
+          −
+        </button>
+        <button type="button" class="zoom" id="zoomIn" aria-label="Zoom in">
+          +
+        </button>
+      </span>
+      <button type="button" class="zoom" id="cameraView">Camera view</button>
+      <button type="button" class="zoom" id="fitView">Fit view</button>
+      <span id="hint"
+        >Default: camera view · Move: WASD · Rotate: arrows · Orbit: drag ·
+        Zoom: wheel / buttons / + −.</span
+      >
+    </div>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        }
+      }
+    </script>
+    <script type="module">
+      import * as THREE from "three";
+      import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+      import { PLYLoader } from "three/addons/loaders/PLYLoader.js";
 
-    document.getElementById("file").addEventListener("change", (e) => {
-      const f = e.target.files?.[0];
-      if (!f) return;
-      const reader = new FileReader();
-      reader.onload = () => loadPlyText(reader.result);
-      reader.readAsArrayBuffer(f);
-    });
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x1a1a1f);
 
-    window.addEventListener("resize", () => {
-      camera.aspect = window.innerWidth / window.innerHeight;
-      camera.updateProjectionMatrix();
+      const camera = new THREE.PerspectiveCamera(
+        55,
+        window.innerWidth / window.innerHeight,
+        0.01,
+        5000,
+      );
+      camera.position.set(0, 0, 4);
+
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
       renderer.setSize(window.innerWidth, window.innerHeight);
-    });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      document.body.appendChild(renderer.domElement);
 
-    function tick() {
-      requestAnimationFrame(tick);
-      controls.update();
-      renderer.render(scene, camera);
-    }
-    tick();
-  </script>
-</body>
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.enableZoom = true;
+      controls.zoomSpeed = 1.2;
+
+      const clock = new THREE.Clock();
+      const pressedKeys = new Set();
+      let moveSpeed = 1;
+
+      // Move camera toward or away from orbit target (factor < 1 => zoom in).
+      function dolly(factor) {
+        const offset = new THREE.Vector3().subVectors(
+          camera.position,
+          controls.target,
+        );
+        const dist = offset.length();
+        if (dist < 1e-12) return;
+        offset.normalize();
+        const minD = Math.max(camera.near * 2, 1e-6);
+        const maxD = Math.min(camera.far * 0.99, 1e15);
+        const newDist = THREE.MathUtils.clamp(dist * factor, minD, maxD);
+        offset.multiplyScalar(newDist);
+        camera.position.copy(controls.target.clone().add(offset));
+        controls.update();
+      }
+
+      document
+        .getElementById("zoomIn")
+        .addEventListener("click", () => dolly(0.85));
+      document
+        .getElementById("zoomOut")
+        .addEventListener("click", () => dolly(1 / 0.85));
+
+      window.addEventListener("keydown", (e) => {
+        if (e.target instanceof Element && e.target.matches("input, textarea"))
+          return;
+        if (
+          e.code === "KeyW" ||
+          e.code === "KeyA" ||
+          e.code === "KeyS" ||
+          e.code === "KeyD" ||
+          e.code === "ArrowUp" ||
+          e.code === "ArrowDown" ||
+          e.code === "ArrowLeft" ||
+          e.code === "ArrowRight"
+        ) {
+          e.preventDefault();
+          pressedKeys.add(e.code);
+          return;
+        }
+        if (e.key === "+" || e.key === "=") {
+          e.preventDefault();
+          dolly(0.85);
+        } else if (e.key === "-" || e.key === "_") {
+          e.preventDefault();
+          dolly(1 / 0.85);
+        }
+      });
+
+      window.addEventListener("keyup", (e) => {
+        pressedKeys.delete(e.code);
+      });
+
+      scene.add(new THREE.AmbientLight(0xffffff, 1.2));
+
+      let points = null;
+      let activeView = "camera";
+      let collisionGrid = null;
+      let collisionCellSize = 1;
+      let collisionRadius = 0.1;
+
+      function getObjectRadius(obj) {
+        const box = new THREE.Box3().setFromObject(obj);
+        const sphere = box.getBoundingSphere(new THREE.Sphere());
+        return Math.max(sphere.radius, 1e-6);
+      }
+
+      function gridKey(x, y, z) {
+        return `${Math.floor(x / collisionCellSize)},${Math.floor(y / collisionCellSize)},${Math.floor(z / collisionCellSize)}`;
+      }
+
+      function buildCollisionGrid(obj) {
+        obj.updateMatrixWorld(true);
+
+        const box = new THREE.Box3().setFromObject(obj);
+        const size = box.getSize(new THREE.Vector3());
+        const radius = Math.max(size.x, size.y, size.z, 1e-6);
+        collisionRadius = radius * 0.035;
+        collisionCellSize = collisionRadius;
+
+        const positions = obj.geometry.attributes.position;
+        const worldPositions = new Float32Array(positions.count * 3);
+        const grid = new Map();
+        const point = new THREE.Vector3();
+
+        for (let i = 0; i < positions.count; i++) {
+          point.fromBufferAttribute(positions, i).applyMatrix4(obj.matrixWorld);
+          const offset = i * 3;
+          worldPositions[offset] = point.x;
+          worldPositions[offset + 1] = point.y;
+          worldPositions[offset + 2] = point.z;
+
+          const key = gridKey(point.x, point.y, point.z);
+          const cell = grid.get(key);
+          if (cell) {
+            cell.push(i);
+          } else {
+            grid.set(key, [i]);
+          }
+        }
+
+        collisionGrid = { grid, positions: worldPositions };
+      }
+
+      function collidesWithPointCloud(position) {
+        if (!collisionGrid) return false;
+
+        const cx = Math.floor(position.x / collisionCellSize);
+        const cy = Math.floor(position.y / collisionCellSize);
+        const cz = Math.floor(position.z / collisionCellSize);
+        const radiusSq = collisionRadius * collisionRadius;
+
+        for (let x = cx - 1; x <= cx + 1; x++) {
+          for (let y = cy - 1; y <= cy + 1; y++) {
+            for (let z = cz - 1; z <= cz + 1; z++) {
+              const cell = collisionGrid.grid.get(`${x},${y},${z}`);
+              if (!cell) continue;
+
+              for (const pointIndex of cell) {
+                const offset = pointIndex * 3;
+                const dx = position.x - collisionGrid.positions[offset];
+                const dy = position.y - collisionGrid.positions[offset + 1];
+                const dz = position.z - collisionGrid.positions[offset + 2];
+                if (dx * dx + dy * dy + dz * dz < radiusSq) return true;
+              }
+            }
+          }
+        }
+
+        return false;
+      }
+
+      function fitCameraToObject(obj) {
+        const box = new THREE.Box3().setFromObject(obj);
+        const size = box.getSize(new THREE.Vector3());
+        const center = box.getCenter(new THREE.Vector3());
+        const maxDim = Math.max(size.x, size.y, size.z, 1e-6);
+        const dist = maxDim * 1.8;
+        moveSpeed = maxDim * 0.6;
+        controls.target.copy(center);
+        camera.position.copy(
+          center
+            .clone()
+            .add(new THREE.Vector3(dist * 0.6, dist * 0.35, dist * 0.9)),
+        );
+        camera.near = maxDim / 2000;
+        camera.far = maxDim * 200;
+        camera.updateProjectionMatrix();
+        controls.update();
+      }
+
+      function setCameraView(obj) {
+        const radius = getObjectRadius(obj);
+        moveSpeed = radius * 0.6;
+        controls.target.set(0, 0, radius);
+        camera.position.set(0, 0, 0);
+        camera.near = Math.max(radius / 10000, 1e-6);
+        camera.far = radius * 20;
+        camera.updateProjectionMatrix();
+        controls.update();
+      }
+
+      function applyActiveView() {
+        if (!points) return;
+        if (activeView === "fit") {
+          fitCameraToObject(points);
+        } else {
+          setCameraView(points);
+        }
+      }
+
+      function moveCameraAndTarget(delta) {
+        if (!collisionGrid) {
+          camera.position.add(delta);
+          controls.target.add(delta);
+          return;
+        }
+
+        const steps = Math.max(1, Math.ceil(delta.length() / (collisionRadius * 0.5)));
+        const stepDelta = delta.clone().divideScalar(steps);
+
+        for (let i = 0; i < steps; i++) {
+          moveCameraOneStep(stepDelta);
+        }
+      }
+
+      function moveCameraOneStep(delta) {
+        const nextPosition = camera.position.clone().add(delta);
+        if (!collidesWithPointCloud(nextPosition)) {
+          camera.position.copy(nextPosition);
+          controls.target.add(delta);
+          return;
+        }
+
+        const actualDelta = new THREE.Vector3();
+        const axisDeltas = [
+          new THREE.Vector3(delta.x, 0, 0),
+          new THREE.Vector3(0, delta.y, 0),
+          new THREE.Vector3(0, 0, delta.z),
+        ];
+
+        for (const axisDelta of axisDeltas) {
+          if (axisDelta.lengthSq() === 0) continue;
+          const axisPosition = camera.position.clone().add(actualDelta).add(axisDelta);
+          if (!collidesWithPointCloud(axisPosition)) actualDelta.add(axisDelta);
+        }
+
+        camera.position.add(actualDelta);
+        controls.target.add(actualDelta);
+      }
+
+      function rotateCameraView(yaw, pitch) {
+        const look = new THREE.Vector3().subVectors(
+          controls.target,
+          camera.position,
+        );
+        const distance = look.length();
+        if (distance < 1e-12) return;
+
+        const forward = look.clone().normalize();
+        const right = new THREE.Vector3()
+          .crossVectors(forward, camera.up)
+          .normalize();
+        look.applyAxisAngle(camera.up, yaw);
+        look.applyAxisAngle(right, pitch);
+        controls.target.copy(camera.position).add(look.setLength(distance));
+      }
+
+      function updateKeyboardNavigation(deltaSeconds) {
+        if (!pressedKeys.size) return;
+
+        const look = new THREE.Vector3().subVectors(
+          controls.target,
+          camera.position,
+        );
+        if (look.lengthSq() < 1e-12) return;
+
+        const forward = look.normalize();
+        const right = new THREE.Vector3()
+          .crossVectors(forward, camera.up)
+          .normalize();
+        const movement = new THREE.Vector3();
+
+        if (pressedKeys.has("KeyW")) movement.add(forward);
+        if (pressedKeys.has("KeyS")) movement.sub(forward);
+        if (pressedKeys.has("KeyD")) movement.add(right);
+        if (pressedKeys.has("KeyA")) movement.sub(right);
+        if (movement.lengthSq() > 0) {
+          movement.normalize().multiplyScalar(moveSpeed * deltaSeconds);
+          moveCameraAndTarget(movement);
+        }
+
+        const rotationSpeed = 1.8 * deltaSeconds;
+        const yaw =
+          (pressedKeys.has("ArrowLeft") ? rotationSpeed : 0) -
+          (pressedKeys.has("ArrowRight") ? rotationSpeed : 0);
+        const pitch =
+          (pressedKeys.has("ArrowUp") ? rotationSpeed : 0) -
+          (pressedKeys.has("ArrowDown") ? rotationSpeed : 0);
+        if (yaw || pitch) rotateCameraView(yaw, pitch);
+
+        controls.update();
+      }
+
+      function loadPlyText(text) {
+        if (points) {
+          scene.remove(points);
+          points.geometry.dispose();
+          if (points.material.map) points.material.map.dispose();
+          points.material.dispose();
+          points = null;
+        }
+        const loader = new PLYLoader();
+        const geom = loader.parse(text);
+        geom.computeBoundingSphere();
+        const mat = new THREE.PointsMaterial({
+          size: Math.max(0.002, (geom.boundingSphere?.radius || 1) * 0.0025),
+          sizeAttenuation: true,
+          vertexColors: true,
+        });
+        points = new THREE.Points(geom, mat);
+        const sx = document.getElementById("flipX").checked ? -1 : 1;
+        const sy = document.getElementById("flipY").checked ? -1 : 1;
+        points.scale.set(sx, sy, 1);
+        scene.add(points);
+        buildCollisionGrid(points);
+        applyActiveView();
+      }
+
+      document.getElementById("cameraView").addEventListener("click", () => {
+        activeView = "camera";
+        applyActiveView();
+      });
+      document.getElementById("fitView").addEventListener("click", () => {
+        activeView = "fit";
+        applyActiveView();
+      });
+
+      document.getElementById("flipY").addEventListener("change", () => {
+        if (points) {
+          points.scale.y = document.getElementById("flipY").checked ? -1 : 1;
+          points.updateMatrixWorld(true);
+          buildCollisionGrid(points);
+          applyActiveView();
+        }
+      });
+      document.getElementById("flipX").addEventListener("change", () => {
+        if (points) {
+          points.scale.x = document.getElementById("flipX").checked ? -1 : 1;
+          points.updateMatrixWorld(true);
+          buildCollisionGrid(points);
+          applyActiveView();
+        }
+      });
+
+      document.getElementById("file").addEventListener("change", (e) => {
+        const f = e.target.files?.[0];
+        if (!f) return;
+        const reader = new FileReader();
+        reader.onload = () => loadPlyText(reader.result);
+        reader.readAsArrayBuffer(f);
+      });
+
+      window.addEventListener("resize", () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      function tick() {
+        requestAnimationFrame(tick);
+        updateKeyboardNavigation(clock.getDelta());
+        controls.update();
+        renderer.render(scene, camera);
+      }
+      tick();
+    </script>
+  </body>
 </html>
